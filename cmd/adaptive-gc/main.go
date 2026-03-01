@@ -2,35 +2,44 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"os/signal"
-	"runtime"
 	"syscall"
 	"time"
 
 	gc "github.com/samborkent/adaptive-gc"
 )
 
-type garbage struct {
-	_   [1024]bool
-	ptr *bool
-}
-
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	gc.AutoAdapt(ctx)
+	gc.AutoAdapt(ctx, 0.66, 0.95)
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		g := &garbage{ptr: new(bool)}
-
-		runtime.GC()
-		time.Sleep(100 * time.Millisecond)
-
-		_ = g.ptr
+		stressMemory(ctx)
 	}
+}
+
+func stressMemory(ctx context.Context) {
+	var data [][]byte
+
+	for range 1000 {
+		if ctx.Err() != nil {
+			return
+		}
+
+		chunk := make([]byte, 1024*1024) // allocate 1MB
+		rand.Read(chunk)                 // prevent optimizations
+		data = append(data, chunk)       // prevent immediate GC collection
+
+		time.Sleep(10 * time.Millisecond) // slow down allocations
+	}
+
+	// Release the memory
+	data = nil
 }
