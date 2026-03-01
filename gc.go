@@ -163,7 +163,7 @@ func cleanup(ctx context.Context) {
 	// Only adjust GOGC if GC throughput error is larger then margin of error.
 	if errorMagnitude > 0 {
 		// Adapt step size based on the magnitude of the error.
-		stepSize = int(math.Round(10 * errorMagnitude))
+		stepSize = int(math.Floor(10 * errorMagnitude))
 
 		if stepSize >= 1 {
 			if throughputError > 0 && gcPercent-stepSize > 0 {
