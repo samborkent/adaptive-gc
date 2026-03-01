@@ -26,6 +26,8 @@ func AutoAdapt(ctx context.Context, minThroughput, maxThroughput float64) {
 		panic("AutoAdapt may only be called once")
 	}
 
+	callOnce.Store(true)
+
 	// Clamp max throughput to [0%, 100%].
 	maxGCThroughput = max(0, min(1, maxThroughput))
 
@@ -33,8 +35,6 @@ func AutoAdapt(ctx context.Context, minThroughput, maxThroughput float64) {
 	minGCThroughput = max(0, min(maxThroughput, minThroughput))
 
 	_ = runtime.AddCleanup(&obj{}, cleanup, ctx)
-
-	callOnce.Store(true)
 }
 
 var samples = []metrics.Sample{
