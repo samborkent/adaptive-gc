@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"os/signal"
+	"runtime"
 	"syscall"
+	"time"
 
 	gc "github.com/samborkent/adaptive-gc"
 )
@@ -12,19 +14,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	gc.Adapt(ctx)
+	gc.AutoAdapt(ctx, 50, 100)
 
-	var strA []string
-
-	go func() {
-		for {
-			str := make([]string, 1024)
-
-			strA = str
-		}
-	}()
-
-	<-ctx.Done()
-
-	_ = strA
+	for range 20 {
+		runtime.GC()
+		time.Sleep(100 * time.Millisecond)
+	}
 }
