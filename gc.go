@@ -13,45 +13,15 @@ import (
 
 var callOnce atomic.Bool
 
-const (
-	defaultMinGC = 50
-	defaultMaxGC = 100
-)
-
-var (
-	minGCInt   = defaultMinGC
-	maxGCInt   = defaultMaxGC
-	minGCFloat = 0.01 * float64(defaultMinGC)
-	maxGCFloat = 0.01 * float64(defaultMaxGC)
-)
-
 // AutoAdapt starts to automatically adapt the GOGC percentage until the context is cancelled.
-// minGC and maxGC set the minimum and maximum GOGC percentage. For values <= 0, default min-max values [50, 100] will be used.
-func AutoAdapt(ctx context.Context, minGC, maxGC int) {
+func AutoAdapt(ctx context.Context) {
 	if callOnce.Load() {
 		panic("AutoAdapt may only be called once")
 	}
 
-	callOnce.Store(true)
-
-	if minGC > 0 {
-		minGCInt = minGC
-		minGCFloat = 0.01 * float64(minGC)
-	}
-
-	if maxGC > 0 && maxGC > minGC {
-		maxGCInt = maxGC
-		maxGCFloat = 0.01 * float64(maxGC)
-	}
-
-	if minGCInt == maxGCInt {
-		// Min and max are equal, so we cannot auto adapt the GC.
-		// This is equivalent to setting [debug.SetGCPercent] directly and returning.
-		debug.SetGCPercent(minGCInt)
-		return
-	}
-
 	_ = runtime.AddCleanup(&obj{}, cleanup, ctx)
+
+	callOnce.Store(true)
 }
 
 type obj struct {
@@ -97,10 +67,6 @@ var samples = []metrics.Sample{
 	},
 }
 
-const sigmoidFactor = 300.0
-
-var sigmoidExp = math.Exp(-sigmoidFactor)
-
 var (
 	prevGCTime    = 0.0
 	prevUserTime  = 0.0
@@ -113,7 +79,19 @@ var (
 	prevOverhead  = 0.0
 )
 
-const errorMargin = 0.01
+// K-value used in sigmoid model.
+const sigmoidFactor = 300.0
+
+// Pre-computed exponent used in scaling factor of sigmoid model.
+var sigmoidExp = math.Exp(-sigmoidFactor)
+
+const (
+	// Margin for GC throughput error.
+	errorMargin = 0.02
+	// Minimum and maximum GC throughput used for scaling the sigmoid model.
+	minThroughput = 0.50
+	maxThroughput = 0.95
+)
 
 var stepSize = 1
 
@@ -139,7 +117,7 @@ func cleanup(ctx context.Context) {
 	gcCount := samples[7].Value.Uint64()
 	gcPercent := int(samples[8].Value.Uint64())
 
-	// Calculate last GC cycle times.
+	// Calculate times of last GC cycle.
 	deltaGCTime := thisGCTime - prevGCTime
 	deltaUserTime := thisUserTime - prevUserTime
 	deltaTotalTime := thisTotalTime - prevTotalTime
@@ -162,24 +140,29 @@ func cleanup(ctx context.Context) {
 	prevOverhead = overhead
 
 	// Calculate scaling factor and offset that clamp the sigmoid to [minGC, maxGC).
-	scalingFactor := (maxGCFloat - minGCFloat) * (2 + 2*sigmoidExp) / (maxGCFloat * (1 - sigmoidExp))
-	scalingOffset := minGCFloat - 0.5*scalingFactor*maxGCFloat
+	scalingFactor := (maxThroughput - minThroughput) * (2 + 2*sigmoidExp) / (maxThroughput * (1 - sigmoidExp))
+	scalingOffset := minThroughput - 0.5*scalingFactor*maxThroughput
 
 	// Calculate the target GC throughput based on the real-time GC overhead using the sigmoid model.
-	targetThroughput := (scalingFactor*maxGCFloat)/(1+math.Exp(-sigmoidFactor*averageOverhead)) + scalingOffset
+	targetThroughput := (scalingFactor*maxThroughput)/(1+math.Exp(-sigmoidFactor*averageOverhead)) + scalingOffset
 
+	// Calculate throughput error as the deviation between real-time GC throughput and target GC througput.
 	throughputError := averageThroughput - targetThroughput
+	errorMagnitude := math.Abs(throughputError)
+
+	// Adapt step size based on the magnitude of the error.
+	stepSize = int(math.Floor(50 * errorMagnitude))
 
 	newPercent := gcPercent
 
-	// Only adjust GOGC if GC throughput error is larger then margin of error.
-	if math.Abs(throughputError) > errorMargin {
-		if throughputError > 0 && gcPercent-stepSize >= minGCInt {
+	// Only adjust GOGC if GC throughput error is larger then margin of error and the step size is at least 1.
+	if errorMagnitude > errorMargin && stepSize >= 1 {
+		if throughputError > 0 && gcPercent-stepSize >= 0 {
 			// Real-time GC throughput is higher than the target.
 			// Decrease GOGC by one step.
 			newPercent = gcPercent - stepSize
 			debug.SetGCPercent(newPercent)
-		} else if throughputError < 0 && gcPercent+stepSize <= maxGCInt {
+		} else if throughputError < 0 {
 			// Real-time GC throughput is lower than the target.
 			// Increase GOGC by one step.
 			newPercent = gcPercent + stepSize
@@ -194,6 +177,7 @@ func cleanup(ctx context.Context) {
 		slog.String("realtime_overhead", fmt.Sprintf("%.2f%%", 100*averageOverhead)),
 		slog.String("target_throughput", fmt.Sprintf("%.2f%%", 100*targetThroughput)),
 		slog.String("throughput_error", fmt.Sprintf("%.2f%%", 100*throughputError)),
+		slog.String("step_size", fmt.Sprintf("%d%%", stepSize)),
 		slog.String("new_percent", fmt.Sprintf("%d%%", newPercent)),
 	)
 
