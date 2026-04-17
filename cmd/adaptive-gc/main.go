@@ -14,7 +14,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	gc.AutoAdapt(ctx, 0.66, 0.95)
+	gc.AutoAdapt(ctx)
 
 	for {
 		if ctx.Err() != nil {

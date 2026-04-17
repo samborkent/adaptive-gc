@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"runtime/metrics"
+	"strconv"
 	"sync/atomic"
 )
 
@@ -17,22 +19,24 @@ type obj struct {
 	_ *struct{}
 }
 
-var minGCThroughput, maxGCThroughput float64
-
 // AutoAdapt starts to automatically adapt the GOGC percentage until the context is cancelled.
 // minThroughput and maxThroughput represent the GC throughput limits.
-func AutoAdapt(ctx context.Context, minThroughput, maxThroughput float64) {
+func AutoAdapt(ctx context.Context) {
 	if callOnce.Load() {
 		panic("AutoAdapt may only be called once")
 	}
 
 	callOnce.Store(true)
 
-	// Clamp max throughput to [0%, 100%].
-	maxGCThroughput = max(0, min(1, maxThroughput))
-
-	// Clamp min throughput to [0%, max GC throughput].
-	minGCThroughput = max(0, min(maxThroughput, minThroughput))
+	gogc := os.Getenv("GOGC")
+	if gogc != "" {
+		maxGOGC, err := strconv.ParseInt(gogc, 10, 64)
+		if err != nil {
+			panic(fmt.Sprintf("failed to parse GOGC environment variable: %v", err))
+		} else {
+			maxGOGCPercent = int(maxGOGC)
+		}
+	}
 
 	_ = runtime.AddCleanup(&obj{}, cleanup, ctx)
 }
@@ -67,10 +71,6 @@ var samples = []metrics.Sample{
 		Name: "/cpu/classes/total:cpu-seconds",
 	},
 	{ // 7
-		// GCCount
-		Name: "/gc/cycles/total:gc-cycles",
-	},
-	{ // 8
 		// GCPercent
 		Name: "/gc/gogc:percent",
 	},
@@ -96,10 +96,16 @@ var sigmoidExp = math.Exp(-sigmoidFactor)
 
 const (
 	// Margin for GC throughput error.
-	errorMargin = 0.01
+	errorMargin = 0.0075
+
+	minGCThroughput = 0.7 * maxGCThroughput
+	maxGCThroughput = 0.95
+	minGCStepSize   = 10
+	maxGCStepSize   = 40
+	minGOGCPercent  = 30
 )
 
-var stepSize = 1
+var maxGOGCPercent = 100
 
 func cleanup(ctx context.Context) {
 	select {
@@ -120,8 +126,7 @@ func cleanup(ctx context.Context) {
 
 	userTime := samples[5].Value.Float64()
 	totalTime := samples[6].Value.Float64()
-	gcCount := samples[7].Value.Uint64()
-	gcPercent := int(samples[8].Value.Uint64())
+	gcPercent := int(samples[7].Value.Uint64())
 
 	// Calculate times of last GC cycle.
 	deltaGCTime := gcTime - prevGCTime
@@ -160,28 +165,29 @@ func cleanup(ctx context.Context) {
 
 	newPercent := gcPercent
 
+	var stepSize int
+
 	// Only adjust GOGC if GC throughput error is larger then margin of error.
 	if errorMagnitude > 0 {
 		// Adapt step size based on the magnitude of the error.
-		stepSize = int(math.Floor(10 * errorMagnitude))
+		stepSize = min(int(math.Floor(10*errorMagnitude)), maxGCStepSize)
 
-		if stepSize >= 1 {
+		if stepSize >= minGCStepSize {
 			if throughputError > 0 && gcPercent-stepSize > 0 {
 				// Real-time GC throughput is higher than the target.
 				// Decrease GOGC by one step.
-				newPercent = gcPercent - stepSize
+				newPercent = max(gcPercent-stepSize, minGOGCPercent)
 				debug.SetGCPercent(newPercent)
 			} else if throughputError < 0 {
 				// Real-time GC throughput is lower than the target.
 				// Increase GOGC by one step.
-				newPercent = gcPercent + stepSize
+				newPercent = min(gcPercent+stepSize, maxGOGCPercent)
 				debug.SetGCPercent(newPercent)
 			}
 		}
 	}
 
 	slog.InfoContext(ctx, "gc cycle",
-		slog.Uint64("index", gcCount),
 		slog.String("percent", fmt.Sprintf("%d%%", gcPercent)),
 		slog.String("realtime_throughput", fmt.Sprintf("%.2f%%", 100*averageThroughput)),
 		slog.String("realtime_overhead", fmt.Sprintf("%.4f%%", 100*averageOverhead)),
